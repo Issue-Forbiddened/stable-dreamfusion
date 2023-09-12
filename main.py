@@ -13,7 +13,7 @@ if __name__ == '__main__':
     class LoadFromFile (argparse.Action):
         def __call__ (self, parser, namespace, values, option_string = None):
             with values as f:
-                # parse arguments in the file and store them in the target namespace
+                # parse arguments in thxe file and store them in the target namespace
                 parser.parse_args(f.read().split(), namespace)
 
     parser = argparse.ArgumentParser()
@@ -38,6 +38,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--guidance', type=str, nargs='*', default=['SD'], help='guidance model')
     parser.add_argument('--guidance_scale', type=float, default=100, help="diffusion model classifier-free guidance scale")
+    # guidance_rescale float
+    parser.add_argument('--guidance_rescale', type=float, default=0., help="diffusion model classifier-free guidance rescale")
 
     parser.add_argument('--save_mesh', action='store_true', help="export an obj mesh with texture")
     parser.add_argument('--mcubes_resolution', type=int, default=256, help="mcubes resolution for extracting mesh")
@@ -76,6 +78,14 @@ if __name__ == '__main__':
     parser.add_argument('--uniform_sphere_rate', type=float, default=0, help="likelihood of sampling camera location uniformly on the sphere surface area")
     parser.add_argument('--grad_clip', type=float, default=-1, help="clip grad of all grad to this limit, negative value disables it")
     parser.add_argument('--grad_clip_rgb', type=float, default=-1, help="clip grad of rgb space grad to this limit, negative value disables it")
+
+    # dreamtime options
+    # dreamtime_m12s12=[0,0,0,0] as default
+    parser.add_argument('--dreamtime_m12s12', type=int, nargs='+', default=[0,0,0,0], help="dreamtime_m12s12=[0,0,0,0] as default")
+
+    # ProlificDreamer options
+    parser.add_argument('--lora', action='store_true', help="add LoRA as ProlificDreamer")
+
     # model options
     parser.add_argument('--bg_radius', type=float, default=1.4, help="if positive, use a background model at sphere(bg_radius)")
     parser.add_argument('--density_activation', type=str, default='exp', choices=['softplus', 'exp'], help="density activation function")
@@ -144,7 +154,7 @@ if __name__ == '__main__':
 
     ### debugging options
     parser.add_argument('--save_guidance', action='store_true', help="save images of the per-iteration NeRF renders, added noise, denoised (i.e. guidance), fully-denoised. Useful for debugging, but VERY SLOW and takes lots of memory!")
-    parser.add_argument('--save_guidance_interval', type=int, default=10, help="save guidance every X step")
+    parser.add_argument('--save_guidance_interval', type=int, default=50, help="save guidance every X step")
 
     ### GUI options
     parser.add_argument('--gui', action='store_true', help="start a GUI")
@@ -367,7 +377,7 @@ if __name__ == '__main__':
             # Adan usually requires a larger LR
             optimizer = lambda model: Adan(model.get_params(5 * opt.lr), eps=1e-8, weight_decay=2e-5, max_grad_norm=5.0, foreach=False)
         else: # adam
-            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+            optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.999), eps=1e-15)
 
         if opt.backbone == 'vanilla':
             scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
@@ -378,8 +388,12 @@ if __name__ == '__main__':
         guidance = nn.ModuleDict()
 
         if 'SD' in opt.guidance:
-            from guidance.sd_utils import StableDiffusion
-            guidance['SD'] = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range)
+            if not opt.lora:
+                from guidance.sd_utils import StableDiffusion
+                guidance['SD'] = StableDiffusion(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range, dreamtime_m12s12=opt.dreamtime_m12s12 if opt.dreamtime_m12s12[0]>0 else None)
+            else:
+                from guidance.sd_utils import StableDiffusion_LoRA
+                guidance['SD'] = StableDiffusion_LoRA(device, opt.fp16, opt.vram_O, opt.sd_version, opt.hf_key, opt.t_range, dreamtime_m12s12=opt.dreamtime_m12s12 if opt.dreamtime_m12s12[0]>0 else None)
 
         if 'IF' in opt.guidance:
             from guidance.if_utils import IF
@@ -393,7 +407,10 @@ if __name__ == '__main__':
             from guidance.clip_utils import CLIP
             guidance['clip'] = CLIP(device)
 
-        trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True)
+        if not opt.lora:
+            trainer = Trainer(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True)
+        else:
+            trainer = Trainer_LoRA(' '.join(sys.argv), 'df', opt, model, guidance, device=device, workspace=opt.workspace, optimizer=optimizer, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint=opt.ckpt, scheduler_update_every_step=True)
 
         trainer.default_view_data = train_loader._data.get_default_view_data()
 

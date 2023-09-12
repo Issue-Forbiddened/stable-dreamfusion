@@ -628,8 +628,7 @@ class Trainer(object):
                     loss = loss + self.guidance['SD'].train_step_perpneg(text_z, weights, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
                                                     save_guidance_path=save_guidance_path)
                 else:
-                    loss = loss + self.guidance['SD'].train_step(text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,
-                                                                save_guidance_path=save_guidance_path)
+                    loss = loss + self.guidance['SD'].train_step(text_z, pred_rgb, as_latent=as_latent, guidance_scale=self.opt.guidance_scale, grad_scale=self.opt.lambda_guidance,                                                                save_guidance_path=save_guidance_path,guidance_rescale=self.opt.guidance_rescale,train_ratio=exp_iter_ratio)
 
             if 'IF' in self.guidance:
                 # interpolate text_z
@@ -1062,6 +1061,10 @@ class Trainer(object):
 
             self.scaler.scale(loss).backward()
 
+            # for name,para in self.guidance['SD'].lora_layers.named_parameters():
+            #     if para.grad is None:
+            #         print(f'name:{name}\' grad is None')
+
             self.post_train_step()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -1346,3 +1349,302 @@ def get_GPU_mem():
         mems.append(int(((mem_total - mem_free)/1024**3)*1000)/1000)
         mem += mems[-1]
     return mem, mems
+
+
+class Trainer_LoRA(Trainer):
+    def __init__(self,
+                argv, # command line args
+                name, # name of this experiment
+                opt, # extra conf
+                model, # network
+                guidance, # guidance network
+                criterion=None, # loss function, if None, assume inline implementation in train_step
+                optimizer=None, # optimizer
+                ema_decay=None, # if use EMA, set the decay
+                lr_scheduler=None, # scheduler
+                metrics=[], # metrics for evaluation, if None, use val_loss to measure performance, else use the first metric.
+                local_rank=0, # which GPU am I
+                world_size=1, # total num of GPUs
+                device=None, # device to use, usually setting to None is OK. (auto choose device)
+                mute=False, # whether to mute all print
+                fp16=False, # amp optimize level
+                max_keep_ckpt=2, # max num of saved ckpts in disk
+                workspace='workspace', # workspace to save logs & ckpts
+                best_mode='min', # the smaller/larger result, the better
+                use_loss_as_metric=True, # use loss as the first metric
+                report_metric_at_train=False, # also report metrics at training
+                use_checkpoint="latest", # which ckpt to use at init time
+                use_tensorboardX=True, # whether to use tensorboard for logging
+                scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                ):
+        self.argv = argv
+        self.name = name
+        self.opt = opt
+        self.mute = mute
+        self.metrics = metrics
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.workspace = workspace
+        self.ema_decay = ema_decay
+        self.fp16 = fp16
+        self.best_mode = best_mode
+        self.use_loss_as_metric = use_loss_as_metric
+        self.report_metric_at_train = report_metric_at_train
+        self.max_keep_ckpt = max_keep_ckpt
+        self.use_checkpoint = use_checkpoint
+        self.use_tensorboardX = use_tensorboardX
+        self.time_stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        self.scheduler_update_every_step = scheduler_update_every_step
+        self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+        self.console = Console()
+
+        model.to(self.device)
+        if self.world_size > 1:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        self.model = model
+
+        # guide model
+        self.guidance = guidance
+        self.embeddings = {}
+
+        # text prompt / images
+        if self.guidance is not None:
+            for key in self.guidance:
+                for p in self.guidance[key].parameters():
+                    p.requires_grad = False
+                self.embeddings[key] = {}
+            self.prepare_embeddings()
+
+        if isinstance(criterion, nn.Module):
+            criterion.to(self.device)
+        self.criterion = criterion
+
+        if self.opt.images is not None:
+            self.pearson = PearsonCorrCoef().to(self.device)
+
+        self.params= []
+        self.params.append({'params': self.model.parameters(),'lr': 0.01})
+        self.params.append({'params': self.guidance['SD'].lora_layers.parameters(),'lr': 1e-4})
+
+        self.optimizer=optim.AdamW(self.params, weight_decay=0., betas=(0.9, 0.999), eps=1e-10)
+
+        if lr_scheduler is None:
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
+        else:
+            self.lr_scheduler = lr_scheduler(self.optimizer)
+
+        if ema_decay is not None:
+            self.ema = ExponentialMovingAverage([p for p in self.model.parameters()]+[p for p in self.guidance['SD'].lora_layers.parameters()], decay=ema_decay)
+            # self.ema = ExponentialMovingAverage(self.model.parameters(), decay=ema_decay)
+        else:
+            self.ema = None
+
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
+
+        # variable init
+        self.total_train_t = 0
+        self.epoch = 0
+        self.global_step = 0
+        self.local_step = 0
+        self.stats = {
+            "loss": [],
+            "valid_loss": [],
+            "results": [], # metrics[0], or valid_loss
+            "checkpoints": [], # record path of saved ckpt, to automatically remove old ckpt
+            "best_result": None,
+        }
+
+        # auto fix
+        if len(metrics) == 0 or self.use_loss_as_metric:
+            self.best_mode = 'min'
+
+        # workspace prepare
+        self.log_ptr = None
+        if self.workspace is not None:
+            os.makedirs(self.workspace, exist_ok=True)
+            self.log_path = os.path.join(workspace, f"log_{self.name}.txt")
+            self.log_ptr = open(self.log_path, "a+")
+
+            self.ckpt_path = os.path.join(self.workspace, 'checkpoints')
+            self.best_path = f"{self.ckpt_path}/{self.name}.pth"
+            os.makedirs(self.ckpt_path, exist_ok=True)
+
+            # Save a copy of image_config in the experiment workspace
+            if opt.image_config is not None:
+                shutil.copyfile(opt.image_config, os.path.join(self.workspace, os.path.basename(opt.image_config)))
+
+            # Save a copy of images in the experiment workspace
+            if opt.images is not None:
+                for image_file in opt.images:
+                    shutil.copyfile(image_file, os.path.join(self.workspace, os.path.basename(image_file)))
+
+        self.log(f'[INFO] Cmdline: {self.argv}')
+        self.log(f'[INFO] opt: {self.opt}')
+        self.log(f'[INFO] Trainer: {self.name} | {self.time_stamp} | {self.device} | {"fp16" if self.fp16 else "fp32"} | {self.workspace}')
+        self.log(f'[INFO] #parameters: {sum([p.numel() for p in model.parameters() if p.requires_grad])}')
+
+        if self.workspace is not None:
+            if self.use_checkpoint == "scratch":
+                self.log("[INFO] Training from scratch ...")
+            elif self.use_checkpoint == "latest":
+                self.log("[INFO] Loading latest checkpoint ...")
+                self.load_checkpoint()
+            elif self.use_checkpoint == "latest_model":
+                self.log("[INFO] Loading latest checkpoint (model only)...")
+                self.load_checkpoint(model_only=True)
+            elif self.use_checkpoint == "best":
+                if os.path.exists(self.best_path):
+                    self.log("[INFO] Loading best checkpoint ...")
+                    self.load_checkpoint(self.best_path)
+                else:
+                    self.log(f"[INFO] {self.best_path} not found, loading latest ...")
+                    self.load_checkpoint()
+            else: # path to ckpt
+                self.log(f"[INFO] Loading {self.use_checkpoint} ...")
+                self.load_checkpoint(self.use_checkpoint)
+
+
+
+    def save_checkpoint(self, name=None, full=False, best=False):
+
+        if name is None:
+            name = f'{self.name}_ep{self.epoch:04d}'
+
+        state = {
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'stats': self.stats,
+        }
+
+        if self.model.cuda_ray:
+            state['mean_density'] = self.model.mean_density
+
+        if self.opt.dmtet:
+            state['tet_scale'] = self.model.tet_scale.cpu().numpy()
+
+        if full:
+            state['optimizer'] = self.optimizer.state_dict()
+            state['lr_scheduler'] = self.lr_scheduler.state_dict()
+            state['scaler'] = self.scaler.state_dict()
+            if self.ema is not None:
+                state['ema'] = self.ema.state_dict()
+
+        if not best:
+
+            state['model'] = self.model.state_dict()
+            state['guidance_lora'] = self.guidance['SD'].lora_layers.state_dict()
+
+            file_path = f"{name}.pth"
+
+            self.stats["checkpoints"].append(file_path)
+
+            if len(self.stats["checkpoints"]) > self.max_keep_ckpt:
+                old_ckpt = os.path.join(self.ckpt_path, self.stats["checkpoints"].pop(0))
+                if os.path.exists(old_ckpt):
+                    os.remove(old_ckpt)
+
+            torch.save(state, os.path.join(self.ckpt_path, file_path))
+
+        else:
+            if len(self.stats["results"]) > 0:
+                # always save best since loss cannot reflect performance.
+                if True:
+                    # self.log(f"[INFO] New best result: {self.stats['best_result']} --> {self.stats['results'][-1]}")
+                    # self.stats["best_result"] = self.stats["results"][-1]
+
+                    # save ema results
+                    if self.ema is not None:
+                        self.ema.store()
+                        self.ema.copy_to()
+
+                    state['model'] = self.model.state_dict()
+                    state['guidance_lora'] = self.guidance['SD'].lora_layers.state_dict()
+
+                    if self.ema is not None:
+                        self.ema.restore()
+
+                    torch.save(state, self.best_path)
+            else:
+                self.log(f"[WARN] no evaluated results found, skip saving best checkpoint.")
+
+    def load_checkpoint(self, checkpoint=None, model_only=False):
+        if checkpoint is None:
+            checkpoint_list = sorted(glob.glob(f'{self.ckpt_path}/*.pth'))
+            if checkpoint_list:
+                checkpoint = checkpoint_list[-1]
+                self.log(f"[INFO] Latest checkpoint is {checkpoint}")
+            else:
+                self.log("[WARN] No checkpoint found, model randomly initialized.")
+                return
+
+        checkpoint_dict = torch.load(checkpoint, map_location=self.device)
+
+        if 'model' not in checkpoint_dict:
+            self.model.load_state_dict(checkpoint_dict)
+            self.log("[INFO] loaded model.")
+            return
+
+        missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint_dict['model'], strict=False)
+        self.log("[INFO] loaded model.")
+        if len(missing_keys) > 0:
+            self.log(f"[WARN] missing keys: {missing_keys}")
+        if len(unexpected_keys) > 0:
+            self.log(f"[WARN] unexpected keys: {unexpected_keys}")
+
+        if 'guidance_lora' in checkpoint_dict:
+            missing_keys_lora, unexpected_keys_lora=\
+                self.guidance['SD'].lora_layers.load_state_dict(checkpoint_dict['guidance_lora'])
+            self.log("[INFO] loaded guidance lora.")
+            if len(missing_keys_lora) > 0:
+                self.log(f"[WARN] LoRA missing keys: {missing_keys_lora}")
+            if len(unexpected_keys_lora) > 0:
+                self.log(f"[WARN] LoRA unexpected keys: {unexpected_keys_lora}")
+
+
+        if self.ema is not None and 'ema' in checkpoint_dict:
+            try:
+                self.ema.load_state_dict(checkpoint_dict['ema'])
+                self.log("[INFO] loaded EMA.")
+            except:
+                self.log("[WARN] failed to loaded EMA.")
+
+        if self.model.cuda_ray:
+            if 'mean_density' in checkpoint_dict:
+                self.model.mean_density = checkpoint_dict['mean_density']
+
+        if self.opt.dmtet:
+            if 'tet_scale' in checkpoint_dict:
+                new_scale = torch.from_numpy(checkpoint_dict['tet_scale']).to(self.device)
+                self.model.verts *= new_scale / self.model.tet_scale
+                self.model.tet_scale = new_scale
+
+        if model_only:
+            return
+
+        self.stats = checkpoint_dict['stats']
+        self.epoch = checkpoint_dict['epoch']
+        self.global_step = checkpoint_dict['global_step']
+        self.log(f"[INFO] load at epoch {self.epoch}, global step {self.global_step}")
+
+        if self.optimizer and 'optimizer' in checkpoint_dict:
+            try:
+                self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
+                self.log("[INFO] loaded optimizer.")
+            except:
+                self.log("[WARN] Failed to load optimizer.")
+
+        if self.lr_scheduler and 'lr_scheduler' in checkpoint_dict:
+            try:
+                self.lr_scheduler.load_state_dict(checkpoint_dict['lr_scheduler'])
+                self.log("[INFO] loaded scheduler.")
+            except:
+                self.log("[WARN] Failed to load scheduler.")
+
+        if self.scaler and 'scaler' in checkpoint_dict:
+            try:
+                self.scaler.load_state_dict(checkpoint_dict['scaler'])
+                self.log("[INFO] loaded scaler.")
+            except:
+                self.log("[WARN] Failed to load scaler.")
+

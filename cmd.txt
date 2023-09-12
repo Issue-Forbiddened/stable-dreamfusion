@@ -1,0 +1,22 @@
+conda activate diff1
+CUDA_VISIBLE_DEVICES=3 python main.py --text "a DSLR photo of a chimpanzee dressed like Henry VIII king of England" --workspace trial_chimp_1 -O --seed 5 --negative "multiple faces"
+CUDA_VISIBLE_DEVICES=3 python main.py --text "a DSLR photo of a chimpanzee dressed like Henry VIII king of England" --workspace trial_chimp_test -O --seed 5 --max_ray_batch 512 --max_steps 128
+CUDA_VISIBLE_DEVICES=2 python main.py --text "a DSLR photo of a chimpanzee dressed like Henry VIII king of England" --workspace trial_chimp_guidance_10  -O --seed 5 --guidance_scale 10. --fp16 --max_ray_batch 512 --max_steps 128
+CUDA_VISIBLE_DEVICES=2 python main.py --text "a DSLR photo of a chimpanzee dressed like Henry VIII king of England" --workspace trial_chimp_dreamtime  -O --seed 5 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999
+
+
+CUDA_VISIBLE_DEVICES=1 python main.py --text "a DSLR photo of a chimpanzee dressed like Henry VIII king of England" --workspace trial_chimp_dreamtime_guidance_scale_10  -O --seed 5 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100 --t_range 0.001 0.999 --guidance_scale 10.
+
+CUDA_VISIBLE_DEVICES=2 python main.py --text "trump figure" --workspace trial_trump_dreamtime_1  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam"
+CUDA_VISIBLE_DEVICES=3 python main.py --text "trump figure" --workspace trial_trump_dreamtime_linear_t  -O --seed 42 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam"
+
+CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_dreamtime_w  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam"
+
+CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_dreamtime_w_lora  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam" --lora
+
+CUDA_VISIBLE_DEVICES=0 python main.py --text "trump figure" --workspace trial_trump_w_lora  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128  --optim "adam" --lora
+
+CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_dreamtime_vis  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam" --save_guidance
+
+
+CUDA_VISIBLE_DEVICES=0 python main.py --text "trump figure" --workspace trial_trump_grad_scale_10_guidance_scale_10  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128  --optim "adam" --lambda_guidance 10. --guidance_scale 10. --save_guidance

@@ -38,3 +38,7 @@ data/mona_lisa_*
 data/futuristic_car_*
 data/church_ruins_*
 
+*.png
+events*
+*.jpg
+
