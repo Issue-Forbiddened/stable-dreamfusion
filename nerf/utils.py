@@ -1061,9 +1061,10 @@ class Trainer(object):
 
             self.scaler.scale(loss).backward()
 
-            # for name,para in self.guidance['SD'].lora_layers.named_parameters():
-            #     if para.grad is None:
-            #         print(f'name:{name}\' grad is None')
+            if hasattr(self.guidance['SD'], 'lora_layers'):
+                for name,para in self.guidance['SD'].lora_layers.named_parameters():
+                    if para.grad is None:
+                        print(f'name:{name}\' grad is None')
 
             self.post_train_step()
             self.scaler.step(self.optimizer)
@@ -1411,8 +1412,9 @@ class Trainer_LoRA(Trainer):
         # text prompt / images
         if self.guidance is not None:
             for key in self.guidance:
-                for p in self.guidance[key].parameters():
-                    p.requires_grad = False
+                for n,p in self.guidance[key].named_parameters():
+                    if 'unet' not in n and 'lora' not in n:
+                        p.requires_grad = False
                 self.embeddings[key] = {}
             self.prepare_embeddings()
 

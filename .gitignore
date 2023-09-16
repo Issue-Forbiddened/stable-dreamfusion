@@ -41,4 +41,5 @@ data/church_ruins_*
 *.png
 events*
 *.jpg
-
+trial*
+sds_*

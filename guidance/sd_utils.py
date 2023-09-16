@@ -380,32 +380,54 @@ class StableDiffusion_LoRA(StableDiffusion):
         super().__init__(device, fp16, vram_O, sd_version, hf_key, t_range, dreamtime_m12s12)
  
         # Set correct lora layers
-        lora_attn_procs = {}
+
         self.lora_params=[]
 
         self.lora_unet=deepcopy(self.unet)
         
-        for name in self.lora_unet.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else self.lora_unet.config.cross_attention_dim
+        self.lora_unet,self.lora_layers=self.extract_lora_diffusers(self.lora_unet, self.device)
+    def extract_lora_diffusers(self,unet, device):
+        from diffusers.models.attention_processor import (
+            AttnAddedKVProcessor,
+            AttnAddedKVProcessor2_0,
+            # LoRAAttnAddedKVProcessor,
+            LoRAAttnProcessor,
+            SlicedAttnAddedKVProcessor,
+        )
+        ### ref: https://github.com/huggingface/diffusers/blob/4f14b363297cf8deac3e88a3bf31f59880ac8a96/examples/dreambooth/train_dreambooth_lora.py#L833
+        ### begin lora
+        # Set correct lora layers
+        unet_lora_attn_procs = {}
+        for name, attn_processor in unet.attn_processors.items():
+            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
             if name.startswith("mid_block"):
-                hidden_size = self.lora_unet.config.block_out_channels[-1]
+                hidden_size = unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
                 block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(self.lora_unet.config.block_out_channels))[block_id]
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
             elif name.startswith("down_blocks"):
                 block_id = int(name[len("down_blocks.")])
-                hidden_size = self.lora_unet.config.block_out_channels[block_id]
-            lora_layers=LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim).to(self.device)
-            lora_layers.requires_grad_(True)
-            lora_attn_procs[name] = lora_layers
-            self.lora_params.extend(lora_layers.parameters()) 
+                hidden_size = unet.config.block_out_channels[block_id]
 
-        self.lora_unet.set_attn_processor(lora_attn_procs)
-        # self.lora_layers = AttnProcsLayers(self.lora_unet.attn_processors)
-        # self.lora_layers=self.lora_layers.requires_grad_(True)
-        self.lora_layers=nn.ParameterList(self.lora_params)
-        self.lora_unet.requires_grad_(True)
+            if isinstance(attn_processor, (AttnAddedKVProcessor, SlicedAttnAddedKVProcessor, AttnAddedKVProcessor2_0)):
+                # lora_attn_processor_class = LoRAAttnAddedKVProcessor
+                raise NotImplementedError("LoRAAttnAddedKVProcessor is not implemented yet.")
+            else:
+                lora_attn_processor_class = LoRAAttnProcessor
 
+            unet_lora_attn_procs[name] = lora_attn_processor_class(
+                hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+            ).to(device)
+        unet.set_attn_processor(unet_lora_attn_procs)
+        unet_lora_layers = AttnProcsLayers(unet.attn_processors)
+
+        # self.unet.requires_grad_(True)
+        unet.requires_grad_(False)
+        for param in unet_lora_layers.parameters():
+            param.requires_grad_(True)
+        # self.params_to_optimize = unet_lora_layers.parameters()
+        ### end lora
+        return unet, unet_lora_layers
     def get_t(self,train_ratio,batch_size):
         if self.dreamtime_m12s12 is None:
             if train_ratio<0.3:
@@ -457,6 +479,8 @@ class StableDiffusion_LoRA(StableDiffusion):
         if guidance_rescale:
             noise_pred_lora = self.rescale_noise_cfg(noise_pred_lora, noise_pred_pos_lora, guidance_rescale)
 
+        noise_pred_lora=noise_pred_lora.float()
+        noise_pred_pretrained=noise_pred_pretrained.float()
         # w(t), sigma_t^2
         w = self.get_w(t)
 
@@ -469,8 +493,8 @@ class StableDiffusion_LoRA(StableDiffusion):
         targets = (latents - grad).detach()
         loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
 
-        loss_lora=0.5 * F.mse_loss(noise_pred_lora.float(), noise.float(), reduction='sum') / latents.shape[0]
-        # loss_lora=F.mse_loss(noise_pred_lora.float(), noise.float(), reduction='mean')  
+        # loss_lora=0.5 * F.mse_loss(noise_pred_lora.float(), noise.float(), reduction='sum') / latents.shape[0]
+        loss_lora=F.mse_loss(noise_pred_lora.float(), noise.float(), reduction='mean')  
 
         loss=loss+loss_lora
 

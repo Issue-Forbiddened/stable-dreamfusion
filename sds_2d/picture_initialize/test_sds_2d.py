@@ -7,8 +7,9 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
+from tqdm  import tqdm
 
-prompt = "trump figure"
+prompt = "donald trump"
 latent_num=1
 
 model_key="stabilityai/stable-diffusion-2-1-base"
@@ -183,8 +184,10 @@ def save_guidance(latents,latents_noisy,noise_pred,noise,save_guidance_path,t,as
 
         diff_latent_image=decode_latents((noise_pred-noise).to(pred_x0).type(precision_t))
 
-        # all 3 input images are [1, 3, H, W], e.g. [1, 3, 512, 512]
-        viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image, diff_latent_image],dim=0)
+        zero_latent_image=decode_latents(torch.zeros_like(latents).to(pred_x0).type(precision_t))
+
+
+        viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image, diff_latent_image,zero_latent_image],dim=0)
         save_image(viz_images, save_guidance_path)
 
 total_step=10000

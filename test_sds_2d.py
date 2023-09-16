@@ -7,8 +7,10 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
+from tqdm  import tqdm
 
-prompt = "trump figure"
+# prompt = "donald trump"
+prompt='a photograph of an astronaut riding a horse'
 latent_num=1
 
 model_key="stabilityai/stable-diffusion-2-1-base"
@@ -30,9 +32,9 @@ for p in unet.parameters():
 
 scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
 
-min_step, max_step = 2,998
+min_step, max_step = 20,980
 
-use_dreamtime=True
+use_dreamtime=False
 dreamtime_m12s12=[800,500,300,100] if use_dreamtime else None
 
 def dreamtime_w(t,dreamtime_m12s12=[800,500,300,100]):
@@ -71,8 +73,8 @@ def get_t(train_ratio,batch_size,dreamtime_m12s12=None):
 
 
 def get_latent_codes_as_param(latent_num=latent_num):
-    return torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.rand((latent_num,4, 64,64), device=device, dtype=torch.float32)))
-    # return torch.nn.Parameter(torch.zeros((latent_num,4, 64,64), device=device, dtype=torch.float32))
+    # return torch.nn.Parameter(torch.nn.init.xavier_normal_(torch.rand((latent_num,4, 64,64), device=device, dtype=torch.float32)))
+    return torch.nn.Parameter(torch.randn((latent_num,4, 64,64), device=device, dtype=torch.float32))
 
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     """
@@ -92,34 +94,46 @@ def _get_w(t,alphas, dreamtime_m12s12=None):
         return (1 - alphas[t])
     else:
         return torch.ones_like((1 - alphas[t])) # much better than using w = (1 - alphas[t]), indicating no robustness to w(t) using dreamtime
-alphas=scheduler.alphas.to(device)
-get_w=lambda t: _get_w(t,alphas,dreamtime_m12s12=dreamtime_m12s12)
-
-with torch.no_grad():
-    text_inputs = tokenizer(prompt, padding='max_length', max_length=tokenizer.model_max_length, return_tensors='pt')
-    embeddings = text_encoder(text_inputs.input_ids.to(device))[0].repeat(2*latent_num,1,1)
-
-# latents=get_latent_codes_as_param(latent_num=latent_num)
-
-source_image_path='/home1/jo_891/data1/stable-dreamfusion/trial_trump_dreamtime_w/validation/df_ep0065_0007_rgb.png'
-source_image=Image.open(source_image_path)
-source_image=source_image.resize((512,512))
-source_image=np.array(source_image)
-source_image=source_image.transpose(2,0,1)
-source_image=torch.from_numpy(source_image).unsqueeze(0).to("cuda").to(torch.float16)
 
 def encode(imgs):
     posterior = vae.encode(imgs).latent_dist
     latents = posterior.sample() * vae.config.scaling_factor
     return latents
+alphas=scheduler.alphas.to(device)
+get_w=lambda t: _get_w(t,alphas,dreamtime_m12s12=dreamtime_m12s12)
 
-latents=encode(source_image)
+with torch.no_grad():
+    text_inputs = tokenizer(prompt, padding='max_length', max_length=tokenizer.model_max_length, return_tensors='pt')
+    empty_text_inputs = tokenizer("", padding='max_length', max_length=tokenizer.model_max_length, return_tensors='pt')
+    embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
+    empty_embeddings = text_encoder(empty_text_inputs.input_ids.to(device))[0]
+    embeddings=torch.cat([empty_embeddings,embeddings],dim=0)
 
+# latents=get_latent_codes_as_param(latent_num=latent_num)
+
+# source_image_path='/home1/jo_891/data1/stable-dreamfusion/trial_trump_dreamtime_w/validation/df_ep0065_0007_rgb.png'
+source_image_path=None
+# source_image_path='/home1/jo_891/data1/stable-dreamfusion/trial_trump_dreamtime_w/validation/df_ep0087_0001_rgb.png'
+if source_image_path is None:
+    latents=get_latent_codes_as_param(latent_num=latent_num)
+else:
+    source_image=Image.open(source_image_path)
+    source_image=source_image.resize((512,512))
+    source_image=np.array(source_image)
+    source_image=source_image.transpose(2,0,1)
+    source_image=source_image/255. 
+    source_image=torch.from_numpy(source_image).unsqueeze(0).to("cuda").to(torch.float16)
+    latents=encode(source_image*2-1)
+
+
+total_step=2000
 latents=torch.nn.Parameter(latents.to(torch.float32))
 
-optim=torch.optim.Adam([latents],lr=0.01,weight_decay=0.,betas=(0.9,0.999),eps=1e-8)
+optim=torch.optim.Adam([latents],lr=3e-2)
+# optim=torch.optim.SGD([latents],lr=1e-2)
 
 scaler = torch.cuda.amp.GradScaler(enabled= True if precision_t == torch.float16 else False)
+optim_scheduler=torch.optim.lr_scheduler.StepLR(optim,step_size=total_step//10,gamma=0.9)
 
 def train_step(latents,text_embedding,guidance_scale=100.,guidance_rescale=0.,train_ratio=1.,grad_scale=1.,dreamtime_m12s12=None,save_guidance_path=None):
     t=get_t(train_ratio,batch_size=latents.shape[0],dreamtime_m12s12=dreamtime_m12s12)
@@ -133,7 +147,6 @@ def train_step(latents,text_embedding,guidance_scale=100.,guidance_rescale=0.,tr
         tt = torch.cat([t] * 2)
         noise_pred = unet(latent_model_input, tt, encoder_hidden_states=text_embedding).sample
 
-        # perform guidance (high scale from paper!)
         noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
         if guidance_rescale:
@@ -141,12 +154,14 @@ def train_step(latents,text_embedding,guidance_scale=100.,guidance_rescale=0.,tr
     w = get_w(t)
     grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
     grad = torch.nan_to_num(grad)
+    targets = (latents - grad).detach()
+    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean') / latents.shape[0]
     
     if save_guidance_path is not None:
         save_guidance(latents,latents_noisy,noise_pred,noise,save_guidance_path,t)
 
     targets = (latents - grad).detach()
-    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
+    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean') / latents.shape[0]
 
     return loss
 
@@ -183,13 +198,14 @@ def save_guidance(latents,latents_noisy,noise_pred,noise,save_guidance_path,t,as
 
         diff_latent_image=decode_latents((noise_pred-noise).to(pred_x0).type(precision_t))
 
+        # zero_latent_image=decode_latents(torch.zeros_like(latents).to(pred_x0).type(precision_t))
 
         viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image, diff_latent_image],dim=0)
         save_image(viz_images, save_guidance_path)
 
-total_step=10000
 
-save_path_dir=os.path.join("sds_2d",'picture_initialize_dreamtime')
+
+save_path_dir=os.path.join("sds_2d_right_guidance",'asstr_ramdom_initialize_guidance_10_grad_10')
 os.makedirs(save_path_dir,exist_ok=True)
 # set process bar
 pbar = tqdm(total=total_step)
@@ -201,21 +217,33 @@ writer = SummaryWriter(save_path_dir)
 # save this code to save_path_dir
 os.system(f"cp {__file__} {save_path_dir}")
 
+initial_image_vae=decode_latents(latents.type(precision_t))
+
+initial_image=source_image if source_image_path is not None else initial_image_vae
+
+initial_images=torch.cat([initial_image,initial_image_vae],dim=0)
+
+save_image(initial_images,os.path.join(save_path_dir,"initial_images.png"))
+
+writer.add_image("initial_images",torch.tensor(np.array(Image.open(os.path.join(save_path_dir,"initial_images.png"))).transpose(2,0,1))/255.,0)
+
+save_guidance_interval=total_step//20
 
 for i in (range(0,total_step)):
     optim.zero_grad()
     with torch.cuda.amp.autocast(enabled= True if precision_t == torch.float16 else False):
-        loss=train_step(latents,embeddings,guidance_scale=100.,guidance_rescale=0.,
-                        train_ratio=i/total_step,grad_scale=1.,dreamtime_m12s12=dreamtime_m12s12,
-                        save_guidance_path=os.path.join(save_path_dir,f"{i}.png") if i%100==0 else None)
+        loss=train_step(latents,embeddings,guidance_scale=10.,guidance_rescale=0.,
+                        train_ratio=i/total_step,grad_scale=10.,dreamtime_m12s12=dreamtime_m12s12,
+                        save_guidance_path=os.path.join(save_path_dir,f"{i}.png") if i%save_guidance_interval==0 else None)
     scaler.scale(loss).backward()
     scaler.step(optim)
+    optim_scheduler.step()
     scaler.update()
     pbar.update(1)
     pbar.set_description(f"loss: {loss.item():.4f}")
     writer.add_scalar("loss",loss.item(),i)
     # add image saved by save_guidance
-    if i%100==0:
+    if i%save_guidance_interval==0:
         writer.add_image("guidance",torch.tensor(np.array(Image.open(os.path.join(save_path_dir,f"{i}.png"))).transpose(2,0,1))/255.,i)
 
 

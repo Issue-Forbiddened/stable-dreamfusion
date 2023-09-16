@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_tr
 
 CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_dreamtime_w_lora  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam" --lora
 
-CUDA_VISIBLE_DEVICES=0 python main.py --text "trump figure" --workspace trial_trump_w_lora  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128  --optim "adam" --lora
+CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_w_lora_guidance10  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128  --optim "adam" --lora --save_guidance --guidance_scale 10.
 
 CUDA_VISIBLE_DEVICES=1 python main.py --text "trump figure" --workspace trial_trump_dreamtime_vis  -O --seed 7 --fp16 --max_ray_batch 512 --max_steps 128 --dreamtime_m12s12 800 500 300 100  --t_range 0.001 0.999 --optim "adam" --save_guidance
 
