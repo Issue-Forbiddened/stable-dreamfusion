@@ -11,7 +11,7 @@ from tqdm  import tqdm
 
 # prompt = "donald trump"
 prompt='a photograph of an astronaut riding a horse'
-latent_num=1
+latent_num=2
 
 model_key="stabilityai/stable-diffusion-2-1-base"
 precision_t = torch.float16
@@ -107,7 +107,14 @@ with torch.no_grad():
     empty_text_inputs = tokenizer("", padding='max_length', max_length=tokenizer.model_max_length, return_tensors='pt')
     embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
     empty_embeddings = text_encoder(empty_text_inputs.input_ids.to(device))[0]
+
+    # # for debugging
+    # empty_embeddings=torch.zeros_like(embeddings)
+    # embeddings=torch.ones_like(embeddings)
+
     embeddings=torch.cat([empty_embeddings,embeddings],dim=0)
+    # repeat latent_num times
+    embeddings=torch.cat([embeddings]*latent_num,dim=0)
 
 # latents=get_latent_codes_as_param(latent_num=latent_num)
 
@@ -154,14 +161,12 @@ def train_step(latents,text_embedding,guidance_scale=100.,guidance_rescale=0.,tr
     w = get_w(t)
     grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
     grad = torch.nan_to_num(grad)
-    targets = (latents - grad).detach()
-    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean') / latents.shape[0]
     
     if save_guidance_path is not None:
         save_guidance(latents,latents_noisy,noise_pred,noise,save_guidance_path,t)
 
     targets = (latents - grad).detach()
-    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean') / latents.shape[0]
+    loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean') 
 
     return loss
 
@@ -200,12 +205,20 @@ def save_guidance(latents,latents_noisy,noise_pred,noise,save_guidance_path,t,as
 
         # zero_latent_image=decode_latents(torch.zeros_like(latents).to(pred_x0).type(precision_t))
 
-        viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image, diff_latent_image],dim=0)
+        viz_images=[]
+
+        for i in range(len(pred_rgb_512)):
+            viz_images.append(pred_rgb_512[i])
+            viz_images.append(result_noisier_image[i])
+            viz_images.append(result_hopefully_less_noisy_image[i])
+            viz_images.append(diff_latent_image[i])
+
+        viz_images = torch.stack(viz_images,dim=0)
         save_image(viz_images, save_guidance_path)
 
 
 
-save_path_dir=os.path.join("sds_2d_right_guidance",'asstr_ramdom_initialize_guidance_10_grad_10')
+save_path_dir=os.path.join("sds_2d_right_guidance",'asstr_ramdom_initialize_guidance_100_multi')
 os.makedirs(save_path_dir,exist_ok=True)
 # set process bar
 pbar = tqdm(total=total_step)
@@ -232,8 +245,8 @@ save_guidance_interval=total_step//20
 for i in (range(0,total_step)):
     optim.zero_grad()
     with torch.cuda.amp.autocast(enabled= True if precision_t == torch.float16 else False):
-        loss=train_step(latents,embeddings,guidance_scale=10.,guidance_rescale=0.,
-                        train_ratio=i/total_step,grad_scale=10.,dreamtime_m12s12=dreamtime_m12s12,
+        loss=train_step(latents,embeddings,guidance_scale=100.,guidance_rescale=0.,
+                        train_ratio=i/total_step,grad_scale=1.,dreamtime_m12s12=dreamtime_m12s12,
                         save_guidance_path=os.path.join(save_path_dir,f"{i}.png") if i%save_guidance_interval==0 else None)
     scaler.scale(loss).backward()
     scaler.step(optim)

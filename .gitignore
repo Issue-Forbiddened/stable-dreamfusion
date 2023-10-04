@@ -29,6 +29,13 @@ data/space*
 data/corgi*
 data/turtle*
 
+*.bin
+*.pkl
+*.pt
+*.json
+*.safetensors
+wandb
+
 # Only keep the original image, not the automatically-generated depth, normals, rgba
 data/baby_phoenix_on_ice_*
 data/bollywood_actress_*
